@@ -787,4 +787,595 @@ const State = {
   flashOn: false,
   processing: false,
   mahasiswa: [...DEFAULT_MAHASISWA],
-            
+  presensiHariIni: {},
+  isOnline: false,
+  currentQRText: ''
+};
+
+/* ---------------- DOM ---------------- */
+const $ = id => document.getElementById(id);
+const DOM = {
+  status: $('status'),
+  scanStatus: $('scanStatusText'),
+  presensiStatus: $('presensiStatus'),
+  btnStartScan: $('btnStartScan'),
+  btnFlash: $('btnFlash'),
+  tableBody: $('tableBody'),
+  dataTable: $('dataTable'),
+  loadingData: $('loadingData'),
+  totalMahasiswa: $('totalMahasiswa'),
+  statusDot: $('statusDot'),
+  statusLabel: $('statusLabel'),
+  qrNimInput: $('qrNimInput'),
+  qrResultImage: $('qrResultImage'),
+  qrInfo: $('qrInfo'),
+  qrPreview: $('qrPreview'),
+  waTarget: $('waTarget')
+};
+
+/* ---------------- UTIL ---------------- */
+function todayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#039;');
+}
+function setConnectionStatus(status, message) {
+  if (!DOM.statusDot) return;
+  DOM.statusDot.className = 'dot ' + status;
+  DOM.statusLabel.textContent = message;
+  State.isOnline = (status === 'online');
+}
+let statusTimer;
+function showStatus(message, type = 'info', duration = 4000) {
+  if (!DOM.status) return;
+  const iconMap = { success:'fa-check-circle', error:'fa-exclamation-circle', warning:'fa-triangle-exclamation', info:'fa-info-circle' };
+  DOM.status.innerHTML = `<i class="fas ${iconMap[type]||iconMap.info}"></i> ${message}`;
+  DOM.status.className = type;
+  DOM.status.style.display = 'flex';
+  clearTimeout(statusTimer);
+  if (duration > 0) statusTimer = setTimeout(() => DOM.status.style.display='none', duration);
+}
+
+/* ---------------- CACHE ---------------- */
+function loadCacheMahasiswa() {
+  try { return JSON.parse(localStorage.getItem('presensi_mhs_v3') || '[]'); } catch { return []; }
+}
+function saveCacheMahasiswa(d) {
+  try { localStorage.setItem('presensi_mhs_v3', JSON.stringify(d)); } catch {}
+}
+function loadCachePresensi() {
+  try {
+    const raw = localStorage.getItem('presensi_hari_v3');
+    if (!raw) return null;
+    const p = JSON.parse(raw);
+    if (p.tanggal !== todayStr()) return null;
+    return p.map || {};
+  } catch { return null; }
+}
+function saveCachePresensi(map) {
+  try { localStorage.setItem('presensi_hari_v3', JSON.stringify({ tanggal: todayStr(), map })); } catch {}
+}
+
+/* ---------------- API ---------------- */
+async function apiGet(action, params = {}) {
+  const qs = new URLSearchParams({ action, t: Date.now(), ...params });
+  const res = await fetch(CONFIG.API_URL + '?' + qs.toString(), { redirect: 'follow' });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+async function apiPost(action, payload = {}) {
+  const res = await fetch(CONFIG.API_URL, {
+    method: 'POST',
+    redirect: 'follow',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({ action, ...payload })
+  });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+
+/* ---------------- LOAD DATA ---------------- */
+async function checkConnection() {
+  setConnectionStatus('checking', 'Mengecek koneksi...');
+  try {
+    const json = await apiGet('ping');
+    if (json.success) { setConnectionStatus('online', '✅ Terhubung ke server'); return true; }
+    throw new Error('Ping gagal');
+  } catch {
+    setConnectionStatus('offline', '📴 Offline (mode lokal)');
+    return false;
+  }
+}
+
+async function loadAllData() {
+  // 1. Tampilkan cache dulu
+  const cachedMhs = loadCacheMahasiswa();
+  if (cachedMhs.length) State.mahasiswa = cachedMhs;
+  const cachedPres = loadCachePresensi();
+  if (cachedPres) State.presensiHariIni = cachedPres;
+
+  if (State.mahasiswa.length) {
+    renderDataTable();
+  } else if (DOM.loadingData) {
+    DOM.loadingData.style.display = 'block';
+    DOM.dataTable.style.display = 'none';
+  }
+
+  // 2. Coba server
+  const online = await checkConnection();
+  if (!online) {
+    if (!State.mahasiswa.length) showEmptyState('offline');
+    else showStatus('📂 Mode offline — data dari cache', 'warning', 3000);
+    return;
+  }
+
+  try {
+    const mhsRes = await apiGet('get_all');
+    if (mhsRes.success && Array.isArray(mhsRes.data) && mhsRes.data.length) {
+      State.mahasiswa = mhsRes.data;
+      saveCacheMahasiswa(mhsRes.data);
+    }
+
+    const presRes = await apiGet('get_presensi', { tanggal: todayStr() });
+    if (presRes.success && Array.isArray(presRes.data)) {
+      const map = {};
+      presRes.data.forEach(p => { if (p.nim) map[String(p.nim).trim()] = p; });
+      State.presensiHariIni = map;
+      saveCachePresensi(map);
+    }
+
+    renderDataTable();
+    showStatus(`✅ ${State.mahasiswa.length} mahasiswa · ${Object.keys(State.presensiHariIni).length} hadir hari ini`, 'success', 2500);
+  } catch (err) {
+    console.error(err);
+    if (State.mahasiswa.length) {
+      showStatus('⚠️ Gagal sinkron — pakai cache', 'warning', 3000);
+      renderDataTable();
+    } else {
+      showEmptyState('error', err.message);
+    }
+  }
+}
+
+/* ---------------- RENDER ---------------- */
+function renderDataTable() {
+  if (!DOM.tableBody) return;
+  DOM.tableBody.innerHTML = '';
+
+  if (!State.mahasiswa.length) { showEmptyState('empty'); return; }
+
+  State.mahasiswa.forEach(mhs => {
+    const nim = String(mhs.nim || '').trim();
+    const hadir = !!State.presensiHariIni[nim];
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><strong>${escapeHtml(nim || '-')}</strong></td>
+      <td>${escapeHtml(mhs.nama || '-')}</td>
+      <td>${escapeHtml(mhs.kelas || '-')}</td>
+      <td>${escapeHtml(mhs.jurusan || '-')}</td>
+      <td>
+        <span class="${hadir ? 'status-hadir' : 'status-belum'}">
+          <i class="fas ${hadir ? 'fa-check-circle' : 'fa-circle'}"></i>
+          ${hadir ? 'Hadir' : 'Belum'}
+        </span>
+      </td>`;
+    DOM.tableBody.appendChild(tr);
+  });
+
+  DOM.loadingData.style.display = 'none';
+  DOM.dataTable.style.display = 'table';
+  DOM.totalMahasiswa.textContent = `${Object.keys(State.presensiHariIni).length} / ${State.mahasiswa.length} mahasiswa`;
+}
+
+function showEmptyState(kind, detail = '') {
+  if (!DOM.loadingData) return;
+  DOM.dataTable.style.display = 'none';
+  DOM.loadingData.style.display = 'block';
+  DOM.totalMahasiswa.textContent = '0 mahasiswa';
+
+  if (kind === 'offline') {
+    DOM.loadingData.innerHTML = `
+      <i class="fas fa-wifi" style="color:#f87171;font-size:24px;display:block;margin-bottom:12px;"></i>
+      <strong style="color:#f87171;">Tidak Ada Koneksi</strong><br><br>
+      <span style="color:rgba(255,255,255,0.5);font-size:12px;">Tambahkan data di sheet "Mahasiswa" untuk mulai.</span><br><br>
+      <button onclick="loadAllData()" style="padding:8px 20px;background:#25d366;color:white;border:none;border-radius:8px;cursor:pointer;">
+        <i class="fas fa-sync-alt"></i> Coba Lagi
+      </button>`;
+  } else if (kind === 'empty') {
+    DOM.loadingData.innerHTML = `
+      <i class="fas fa-info-circle" style="color:#fbbf24;font-size:20px;display:block;margin-bottom:12px;"></i>
+      <strong style="color:#fbbf24;">Belum ada data mahasiswa</strong><br><br>
+      <span style="color:rgba(255,255,255,0.5);font-size:12px;">Tambahkan di sheet "Mahasiswa" lalu Refresh.</span>`;
+  } else {
+    DOM.loadingData.innerHTML = `
+      <i class="fas fa-exclamation-circle" style="color:#ef4444;font-size:24px;display:block;margin-bottom:12px;"></i>
+      <strong style="color:#ef4444;">Gagal Memuat Data</strong><br><br>
+      <span style="color:rgba(255,255,255,0.5);font-size:12px;">${escapeHtml(detail)}</span><br><br>
+      <button onclick="loadAllData()" style="padding:8px 20px;background:#25d366;color:white;border:none;border-radius:8px;cursor:pointer;">
+        <i class="fas fa-sync-alt"></i> Coba Lagi
+      </button>`;
+  }
+}
+
+/* ---------------- QR CODE GENERATOR (LOKAL) ---------------- */
+function buatQRCode(element, text, size = 200) {
+  element.innerHTML = '';
+  new QRCode(element, {
+    text: text,
+    width: size,
+    height: size,
+    colorDark: '#0f0c29',
+    colorLight: '#ffffff',
+    correctLevel: QRCode.CorrectLevel.H
+  });
+}
+
+function generateQR() {
+  const qrData = {
+    nim: 'ABSENSI-KELAS',
+    nama: 'Presensi Kelas',
+    kelas: 'Semua',
+    jurusan: 'Semua',
+    link_sheet: CONFIG.SHEET_URL,
+    timestamp: new Date().toISOString()
+  };
+  State.currentQRText = JSON.stringify(qrData);
+  buatQRCode($('qrImage'), State.currentQRText, 200);
+}
+
+function downloadQR() {
+  const canvas = $('qrImage').querySelector('canvas');
+  const img = $('qrImage').querySelector('img');
+  let dataUrl = '';
+  if (canvas) dataUrl = canvas.toDataURL('image/png');
+  else if (img && img.src) dataUrl = img.src;
+  if (!dataUrl) { alert('QR Code belum siap.'); return; }
+
+  const a = document.createElement('a');
+  a.download = 'qr-presensi-kelas.png';
+  a.href = dataUrl;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+}
+
+/* ---------------- QR PER MAHASISWA ---------------- */
+function generateQRCode() {
+  const nim = DOM.qrNimInput.value.trim();
+  if (!nim) { showStatus('❌ Masukkan NIM terlebih dahulu', 'error'); DOM.qrNimInput.focus(); return; }
+  if (nim.length < 3) { showStatus('❌ NIM minimal 3 karakter', 'error'); return; }
+
+  const mhs = State.mahasiswa.find(m => String(m.nim).trim() === nim);
+  if (!mhs) { showStatus(`❌ NIM ${escapeHtml(nim)} tidak terdaftar!`, 'error'); return; }
+
+  const qrData = {
+    nim: mhs.nim,
+    nama: mhs.nama,
+    kelas: mhs.kelas,
+    jurusan: mhs.jurusan,
+    link_sheet: CONFIG.SHEET_URL,
+    timestamp: new Date().toISOString()
+  };
+  State.currentQRText = JSON.stringify(qrData);
+  buatQRCode(DOM.qrResultImage, State.currentQRText, 180);
+
+  DOM.qrInfo.innerHTML = `
+    <strong>NIM:</strong> ${escapeHtml(mhs.nim)} &bull;
+    <strong>Nama:</strong> ${escapeHtml(mhs.nama)} &bull;
+    <strong>Kelas:</strong> ${escapeHtml(mhs.kelas)} &bull;
+    <strong>Jurusan:</strong> ${escapeHtml(mhs.jurusan)}
+    <div style="margin-top:6px;font-size:12px;color:#25d366;">
+      <i class="fas fa-check-circle"></i> QR siap dipakai
+    </div>`;
+  DOM.qrPreview.classList.add('show');
+  showStatus(`✅ QR Code dibuat untuk ${escapeHtml(mhs.nama)}`, 'success');
+}
+
+function downloadQRCode() {
+  const canvas = DOM.qrResultImage.querySelector('canvas');
+  if (!canvas) { showStatus('❌ Tidak ada QR Code', 'error'); return; }
+  const nim = DOM.qrNimInput.value.trim() || 'mahasiswa';
+  const a = document.createElement('a');
+  a.download = `qr-code-${nim}.png`;
+  a.href = canvas.toDataURL('image/png');
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  showStatus('✅ QR Code berhasil didownload!', 'success');
+}
+
+function closeQRPreview() {
+  DOM.qrPreview.classList.remove('show');
+  DOM.qrNimInput.value = '';
+}
+
+/* ---------------- WHATSAPP ---------------- */
+function shareQRToWA() {
+  const nim = DOM.qrNimInput.value.trim();
+  if (!nim) return;
+  const mhs = State.mahasiswa.find(m => String(m.nim).trim() === nim);
+  if (!mhs) return;
+  const pesan = `QR Code Presensi\nNama: ${mhs.nama}\nNIM: ${mhs.nim}\nKelas: ${mhs.kelas}\nJurusan: ${mhs.jurusan}\n\nSilakan scan untuk presensi.`;
+  window.open(`https://wa.me/?text=${encodeURIComponent(pesan)}`, '_blank');
+}
+
+function kirimRekapWA() {
+  const total = State.mahasiswa.length;
+  const hadir = Object.keys(State.presensiHariIni).length;
+  const belum = total - hadir;
+
+  let detail = '';
+  State.mahasiswa.forEach(m => {
+    const nim = String(m.nim).trim();
+    const h = State.presensiHariIni[nim];
+    detail += `• ${m.nama} (${nim}) — ${h ? '✅ Hadir' : '❌ Belum'}\n`;
+  });
+
+  const pesan = `*REKAP PRESENSI KELAS*
+Tanggal: ${todayStr()}
+Total: ${total} mahasiswa
+Hadir: ${hadir}
+Belum: ${belum}
+
+*Detail:*
+${detail}`;
+
+  window.open(`https://wa.me/${CONFIG.WA_NYSA}?text=${encodeURIComponent(pesan)}`, '_blank');
+}
+
+/* ---------------- SCANNER ---------------- */
+function toggleScanner() {
+  if (State.scanning) stopScanner();
+  else startScanner();
+}
+
+function startScanner() {
+  if (State.scanning) return;
+
+  if (State.scanner) {
+    try { State.scanner.clear(); } catch {}
+    State.scanner = null;
+  }
+
+  const readerEl = $('qr-reader');
+  if (readerEl) readerEl.innerHTML = '';
+
+  if (DOM.btnStartScan) {
+    DOM.btnStartScan.classList.add('stop');
+    DOM.btnStartScan.innerHTML = '<i class="fas fa-stop"></i> Stop Scan';
+  }
+
+  try {
+    State.scanner = new Html5Qrcode("qr-reader", {
+      verbose: false,
+      formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE]
+    });
+
+    const config = { fps: 10, qrbox: { width: 250, height: 250 }, aspectRatio: 1.0 };
+    const onSuccess = (text) => onScanSuccess(text);
+    const onError = () => {};
+
+    State.scanner.start({ facingMode: "environment" }, config, onSuccess, onError)
+      .then(() => onScannerStarted('📷 Kamera aktif'))
+      .catch(() => {
+        State.scanner.start({ facingMode: "user" }, config, onSuccess, onError)
+          .then(() => onScannerStarted('📷 Kamera depan aktif'))
+          .catch(err2 => {
+            showStatus('❌ Gagal akses kamera: ' + err2.message, 'error', 0);
+            resetScannerButton();
+          });
+      });
+  } catch (err) {
+    showStatus('❌ Gagal inisialisasi scanner', 'error', 0);
+    resetScannerButton();
+  }
+}
+
+function onScannerStarted(msg) {
+  State.scanning = true;
+  if (DOM.scanStatus) DOM.scanStatus.textContent = '🔍 Mendeteksi QR Code...';
+  if (DOM.presensiStatus) DOM.presensiStatus.textContent = 'Mendeteksi...';
+  showStatus(msg, 'info', 2000);
+}
+
+function stopScanner() {
+  if (State.scanner && State.scanning) {
+    State.scanner.stop()
+      .then(() => {
+        try { State.scanner.clear(); } catch {}
+        State.scanner = null;
+        State.scanning = false;
+        resetScannerButton();
+        if (DOM.scanStatus) DOM.scanStatus.textContent = '⏸ Scanner berhenti';
+      })
+      .catch(() => {});
+  } else {
+    State.scanning = false;
+    resetScannerButton();
+  }
+}
+
+function resetScannerButton() {
+  if (!DOM.btnStartScan) return;
+  DOM.btnStartScan.classList.remove('stop');
+  DOM.btnStartScan.innerHTML = '<i class="fas fa-play"></i> <span id="btnScanLabel">Mulai Scan</span>';
+}
+
+/* ---------------- SCAN SUCCESS ---------------- */
+function onScanSuccess(decodedText) {
+  if (State.processing) return;
+  State.processing = true;
+
+  if (State.scanner && State.scanning) {
+    State.scanner.stop()
+      .then(() => { try { State.scanner.clear(); } catch {} State.scanner = null; State.scanning = false; resetScannerButton(); })
+      .catch(() => {});
+  }
+
+  processPresensi(decodedText);
+}
+
+/* ---------------- PROSES PRESENSI ---------------- */
+async function processPresensi(qrData) {
+  const tanggal = todayStr();
+  try {
+    showStatus('⏳ Memproses presensi...', 'info', 0);
+
+    let nim = '';
+    try {
+      const parsed = JSON.parse(qrData);
+      nim = String(parsed.nim || '').trim();
+    } catch {
+      nim = String(qrData || '').trim();
+    }
+
+    if (!nim || nim.length < 3) {
+      showStatus('❌ NIM tidak valid (minimal 3 karakter)', 'error');
+      return;
+    }
+
+    const mhs = State.mahasiswa.find(m => String(m.nim).trim() === nim);
+    if (!mhs) {
+      showStatus(`❌ NIM ${escapeHtml(nim)} tidak terdaftar!`, 'error');
+      return;
+    }
+
+    if (State.presensiHariIni[nim]) {
+      showStatus(`⚠️ ${escapeHtml(mhs.nama)} sudah presensi hari ini!`, 'warning');
+      if (DOM.scanStatus) DOM.scanStatus.textContent = '⚠️ Sudah presensi';
+      if (DOM.presensiStatus) DOM.presensiStatus.textContent = '⚠️ Sudah hadir';
+      return;
+    }
+
+    const payload = {
+      nim,
+      nama: mhs.nama || '',
+      kelas: mhs.kelas || '',
+      jurusan: mhs.jurusan || '',
+      mataKuliah: 'Presensi Kelas',
+      status: 'Hadir'
+    };
+
+    let result;
+    try {
+      result = await apiPost('presensi', payload);
+    } catch (netErr) {
+      // Offline → simpan lokal
+      State.presensiHariIni[nim] = { nim, tanggal, offline: true, waktu: new Date().toLocaleString('id-ID'), nama: mhs.nama };
+      saveCachePresensi(State.presensiHariIni);
+      renderDataTable();
+      showStatus(`📴 Offline — ${escapeHtml(mhs.nama)} dicatat lokal.`, 'warning', 5000);
+      if (DOM.scanStatus) DOM.scanStatus.textContent = '📴 Tersimpan lokal';
+      notifWA(mhs);
+      return;
+    }
+
+    if (result.success) {
+      State.presensiHariIni[nim] = { nim, tanggal, waktu: result.waktu || '', nama: mhs.nama };
+      saveCachePresensi(State.presensiHariIni);
+      renderDataTable();
+      showStatus(`✅ ${escapeHtml(mhs.nama)} HADIR — tersimpan`, 'success', 3500);
+      if (DOM.scanStatus) DOM.scanStatus.textContent = '✅ Hadir!';
+      if (DOM.presensiStatus) DOM.presensiStatus.textContent = '✅ Hadir';
+      notifWA(mhs);
+    } else if (result.already) {
+      State.presensiHariIni[nim] = { nim, tanggal, waktu: result.data?.waktu || '', nama: mhs.nama };
+      saveCachePresensi(State.presensiHariIni);
+      renderDataTable();
+      showStatus(`⚠️ ${escapeHtml(mhs.nama)} sudah presensi hari ini`, 'warning', 3500);
+      if (DOM.scanStatus) DOM.scanStatus.textContent = '⚠️ Sudah presensi';
+    } else {
+      showStatus('❌ ' + (result.error || 'Gagal menyimpan presensi'), 'error', 4000);
+    }
+  } catch (err) {
+    console.error(err);
+    showStatus('❌ Error: ' + err.message, 'error', 4000);
+  } finally {
+    setTimeout(() => {
+      State.processing = false;
+      if (DOM.scanStatus) DOM.scanStatus.textContent = 'Arahkan ke QR Code';
+      if (!State.scanning) startScanner();
+    }, CONFIG.RESCAN_DELAY_MS);
+  }
+}
+
+/* ---------------- NOTIF WA OTOMATIS SETELAH SCAN ---------------- */
+function notifWA(mhs) {
+  // Otomatis buka WA ke Nysa (optional — bisa di-comment kalau mengganggu)
+  const pesan = `✅ *PRESENSI HADIR*\n\nNama: ${mhs.nama}\nNIM: ${mhs.nim}\nKelas: ${mhs.kelas}\nJurusan: ${mhs.jurusan}\nWaktu: ${new Date().toLocaleString('id-ID')}`;
+  // Uncomment baris di bawah kalau mau otomatis buka WA tiap scan:
+  // window.open(`https://wa.me/${CONFIG.WA_NYSA}?text=${encodeURIComponent(pesan)}`, '_blank');
+}
+
+/* ---------------- FLASH ---------------- */
+async function toggleFlash() {
+  State.flashOn = !State.flashOn;
+  if (!DOM.btnFlash) return;
+
+  if (State.flashOn) {
+    DOM.btnFlash.classList.add('active');
+  } else {
+    DOM.btnFlash.classList.remove('active');
+  }
+
+  try {
+    const video = document.querySelector('#qr-reader video');
+    if (!video || !video.srcObject) return;
+    const track = video.srcObject.getVideoTracks()[0];
+    if (!track) return;
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    if (caps.torch) {
+      await track.applyConstraints({ advanced: [{ torch: State.flashOn }] });
+    }
+  } catch (e) {}
+}
+
+/* ---------------- IZIN KAMERA ---------------- */
+async function checkCameraPermission() {
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      showStatus('❌ Browser tidak mendukung kamera', 'error', 0);
+      return false;
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+    stream.getTracks().forEach(t => t.stop());
+    return true;
+  } catch {
+    showStatus('❌ Izin kamera diperlukan untuk scan QR Code', 'error', 0);
+    return false;
+  }
+}
+
+/* ---------------- INIT ---------------- */
+async function init() {
+  const sheetLink = CONFIG.SHEET_URL + '#gid=' + CONFIG.SHEET_GID_PRESENSI;
+  if ($('sheetLink')) $('sheetLink').href = sheetLink;
+  if ($('footerSheetLink')) $('footerSheetLink').href = sheetLink;
+
+  // Tampilkan target WA
+  if (DOM.waTarget) {
+    DOM.waTarget.textContent = `Rekap akan dikirim ke: +${CONFIG.WA_NYSA}`;
+  }
+
+  generateQR();
+  if (DOM.presensiStatus) DOM.presensiStatus.textContent = 'Menunggu scan...';
+
+  await loadAllData();
+  setInterval(() => loadAllData(), CONFIG.REFRESH_INTERVAL_MS);
+
+  const cameraReady = await checkCameraPermission();
+  if (cameraReady) setTimeout(startScanner, 800);
+}
+
+document.addEventListener('DOMContentLoaded', init);
+
+window.addEventListener('beforeunload', function () {
+  if (State.scanner && State.scanning) {
+    State.scanner.stop().then(() => { try { State.scanner.clear(); } catch {} }).catch(() => {});
+  }
+});
+</script>
+
+</body>
+</html>
+ 
